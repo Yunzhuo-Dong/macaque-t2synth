@@ -1,0 +1,20 @@
+# site-specific environment (copy from scripts/ganmat_env.example.sh)
+scripts/ganmat_env.sh
+# model weights and imaging data are not distributed
+*.pth
+*.pt
+*.nii
+*.nii.gz
+*.npy
+*.npz
+*.mat
+*.tgz
+*.tar.gz
+*.zip
+*.part
+# pipeline outputs
+derivatives/
+logs/
+# python
+__pycache__/
+*.pyc

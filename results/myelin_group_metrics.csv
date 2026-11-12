@@ -1,0 +1,4 @@
+method,n_subjects,n_parcels,group_parcel_r,group_MPC_r,group_gradient1_r,group_moment_mean_r,group_moment_sd_r,group_moment_skew_r,group_moment_kurt_r
+E3,19,73,0.9466,0.8161,0.7683,0.9473,0.8962,0.7765,0.7401
+LUT,19,73,0.6543,0.8024,0.7795,0.6114,0.7453,0.6247,0.4402
+zeroshot,19,73,0.8550,0.7194,0.8578,0.8350,0.7078,0.6773,0.4714

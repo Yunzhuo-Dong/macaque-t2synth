@@ -1,0 +1,10 @@
+# Python 3.10. Install PyTorch with the CUDA build matching your driver (pytorch.org).
+torch>=2.1
+numpy>=1.24
+scipy>=1.10
+nibabel>=5.0
+scikit-image>=0.21
+pandas>=2.0
+matplotlib>=3.7
+# External tools (not pip): ANTs >= 2.4 (tested 2.6.5), FSL >= 6.0.6 (FAST), NMT v2.1 template,
+# GAN-MAT (github.com/CAMIN-neuro/GAN-MAT, commit 414f2c7) with its released model.pth
