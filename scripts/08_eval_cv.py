@@ -17,6 +17,7 @@ Usage:
     source ganmat_env.sh && export CUDA_VISIBLE_DEVICES=0
     "$VENV_PY" 08_eval_cv.py --zeroshot                  # evaluate everything that is trained
     "$VENV_PY" 08_eval_cv.py --aggregate-only            # just rebuild the tables
+    "$VENV_PY" 08_eval_cv.py --zeroshot --zeroshot-target sharedF --tags official_long200_sharedF
 """
 import argparse
 import glob
@@ -29,8 +30,10 @@ import numpy as np
 import pandas as pd
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-METRICS = ["MAE", "PSNR", "pearson_r", "SSIM", "beyond_T1_r", "GM_WM_contrast"]
-HIGHER_BETTER = {"MAE": False, "PSNR": True, "pearson_r": True, "SSIM": True, "beyond_T1_r": True}
+METRICS = ["MAE", "PSNR", "pearson_r", "SSIM", "beyond_T1_r", "GM_WM_contrast",
+           "MAE_paper", "MAE_paper_CSF", "MAE_paper_GM", "MAE_paper_WM", "MAE_paper_p999", "MAE_paper_cal"]
+HIGHER_BETTER = {"MAE": False, "PSNR": True, "pearson_r": True, "SSIM": True, "beyond_T1_r": True,
+                 "MAE_paper": False, "MAE_paper_p999": False, "MAE_paper_cal": False}
 
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 ap.add_argument("--e3-root", default=os.path.join(os.environ.get("PROJECT_DIR", "."), "derivatives", "e3"))
@@ -38,6 +41,8 @@ ap.add_argument("--prep-root", default=os.path.join(os.environ.get("PROJECT_DIR"
 ap.add_argument("--splits", help="split file (default: the single splits_*.json in --e3-root)")
 ap.add_argument("--tags", nargs="*", help="experiment folders to evaluate (default: all with fold checkpoints)")
 ap.add_argument("--zeroshot", action="store_true", help="also evaluate the official model zero-shot per fold")
+ap.add_argument("--zeroshot-target", choices=["n4", "sharedF"], default="n4",
+                help="reference T2w for the zero-shot evaluation; sharedF writes to folder zeroshot_sharedF")
 ap.add_argument("--aggregate-only", action="store_true")
 ap.add_argument("--force", action="store_true")
 ap.add_argument("--eval-args", default="", help="extra arguments passed to 05_e2_zeroshot.py")
@@ -53,7 +58,7 @@ tags = a.tags or sorted({os.path.basename(os.path.dirname(os.path.dirname(c)))
                          for c in glob.glob(os.path.join(a.e3_root, "*", "fold*", "ckpt_best.pth"))})
 
 
-def run_eval(out, label, fold, ckpt=None, seg="fast", norm="human_matched"):
+def run_eval(out, label, fold, ckpt=None, seg="fast", norm="human_matched", target="n4"):
     csv = os.path.join(out, f"{label.lower()}_metrics.csv")
     f = sp["folds"][fold]
     if os.path.exists(csv) and not a.force:
@@ -63,7 +68,7 @@ def run_eval(out, label, fold, ckpt=None, seg="fast", norm="human_matched"):
         print(f"(incomplete: missing {sorted(set(f['test']) - done)}, re-running)", end=" ")
     cmd = [sys.executable, os.path.join(HERE, "05_e2_zeroshot.py"), "--subs", *f["test"],
            "--fit-subs", *f["train"], "--label", label, "--segs", seg, "--variants", norm,
-           "--prep-root", a.prep_root, "--out-root", out, *a.eval_args.split()]
+           "--prep-root", a.prep_root, "--out-root", out, "--target", target, *a.eval_args.split()]
     if ckpt:
         cmd += ["--checkpoint", ckpt]
     os.makedirs(out, exist_ok=True)
@@ -83,19 +88,21 @@ if not a.aggregate_only:
             cfg = json.load(open(os.path.join(os.path.dirname(ck), "config.json")))
             if cfg.get("split", {}).get("test") != sp["folds"][fold]["test"]:
                 sys.exit(f"{tag} fold{fold} was trained on a different split than {splits}")
-            jobs.append((tag, fold, ck, cfg.get("seg", "fast"), cfg.get("norm", "human_matched")))
+            jobs.append((tag, fold, ck, cfg.get("seg", "fast"), cfg.get("norm", "human_matched"),
+                         cfg.get("target", "n4")))
     if a.zeroshot:
-        jobs += [("zeroshot", f, None, "fast", "human_matched") for f in range(len(sp["folds"]))]
-    for i, (tag, fold, ck, seg, norm) in enumerate(jobs, 1):
+        zs = "zeroshot" if a.zeroshot_target == "n4" else f"zeroshot_{a.zeroshot_target}"
+        jobs += [(zs, f, None, "fast", "human_matched", a.zeroshot_target) for f in range(len(sp["folds"]))]
+    for i, (tag, fold, ck, seg, norm, target) in enumerate(jobs, 1):
         out = os.path.join(a.e3_root, tag, f"fold{fold}", "eval")
         print(f"[{i}/{len(jobs)}] {tag} fold{fold} ...", end=" ", flush=True)
-        print(run_eval(out, "E2" if ck is None else "E3", fold, ck, seg, norm), flush=True)
+        print(run_eval(out, "E2" if ck is None else "E3", fold, ck, seg, norm, target), flush=True)
 
 # ------------------------------------------------------------------- aggregate
 rows = []
 for csv in sorted(glob.glob(os.path.join(a.e3_root, "*", "fold*", "eval", "e[23]_metrics.csv"))):
     tag = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(csv))))
-    if a.tags and tag not in set(a.tags) | {"zeroshot"}:  # keep pilot runs out of the tables
+    if a.tags and tag not in set(a.tags) | {"zeroshot", "zeroshot_sharedF"}:  # keep pilot runs out of the tables
         continue
     fold = int(os.path.basename(os.path.dirname(os.path.dirname(csv)))[4:])
     d = pd.read_csv(csv)
@@ -144,16 +151,18 @@ def paired(m1, m2, mask):
 models = [m for m in df["method"].unique() if not m.startswith("E0_") and not m.startswith("real_")]
 pairs = []
 for mask in ("brain", "core"):
-    for m in models:
-        pairs += paired(m, "E0_T1w_LUT", mask)
-    off = [m for m in models if m.startswith("official")]
-    scr = [m for m in models if m.startswith("scratch")]
-    for o in off:
-        for s in scr:
-            pairs += paired(o, s, mask)
-    for o in off:
-        if "zeroshot" in models:
-            pairs += paired(o, "zeroshot", mask)
+    for m in models:  # each model against the LUT fitted to its own target
+        pairs += paired(m, "E0_T1w_LUT@sharedF" if m.endswith("_sharedF") else "E0_T1w_LUT", mask)
+    for sf in (False, True):  # only compare models evaluated against the same reference T2w
+        same = [m for m in models if m.endswith("_sharedF") == sf]
+        off = [m for m in same if m.startswith("official")]
+        scr = [m for m in same if m.startswith("scratch")]
+        zs = "zeroshot_sharedF" if sf else "zeroshot"
+        for o in off:
+            for s in scr:
+                pairs += paired(o, s, mask)
+            if zs in models:
+                pairs += paired(o, zs, mask)
 pairs = pd.DataFrame(pairs)
 pairs.to_csv(os.path.join(a.e3_root, "cv_paired.csv"), index=False, float_format="%.4g")
 

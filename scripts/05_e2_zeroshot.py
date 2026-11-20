@@ -17,6 +17,13 @@ Per subject:
   5  baselines on the same masks: normalised T1w (E0), inverted T1w (E0-inv) and, with
      --fit-subs, the best voxel-wise function of T1w intensity learned on those (training)
      subjects (E0_T1w_LUT: a 256-bin lookup table, monotonic or not)
+  7  original-paper metrics (Park et al., GAN-MAT): each image min-max normalised to [0, 1]
+     inside the mask, then MAE over the mask (MAE_paper) and per tissue (MAE_paper_CSF/GM/WM,
+     evaluation labels). Min-max uses the single darkest/brightest voxel, so it is sensitive to
+     outliers; it is reported for comparability with the paper, not as the primary metric.
+     Two diagnostics of that sensitivity: MAE_paper_p999 (both images clipped to their own
+     P0.1-P99.9 before min-max) and MAE_paper_cal (prediction first given the least-squares
+     scale and offset onto the min-max reference, i.e. intensity calibration removed).
   6  "beyond-T1" correlation = partial correlation of synthetic and real T2w given T1w intensity:
      within the evaluated subject and mask, the conditional mean given T1w intensity (256 bins) is
      removed from both images and the residuals are correlated. Only this part can add
@@ -32,7 +39,7 @@ Metric conventions (every image is normalised independently inside the mask):
 
 Usage:
     source ganmat_env.sh
-    export CUDA_VISIBLE_DEVICES=0          # pick a free GPU
+    export CUDA_VISIBLE_DEVICES=1          # GPU 0 is shared on AICS-Neuro
     "$VENV_PY" 05_e2_zeroshot.py --subs sub-032128 sub-032130
 """
 import argparse
@@ -90,6 +97,8 @@ def parse_args():
     p.add_argument("--fit-subs", nargs="+", help="subjects (never the evaluated ones) to learn the T1w->T2w "
                    "lookup-table baseline (E0_T1w_LUT) from, e.g. the fold's training subjects")
     p.add_argument("--erode-mm", type=float, default=1.0, help="erosion for the 'core' mask")
+    p.add_argument("--target", choices=["n4", "sharedF"], default="n4",
+                   help="T2w reference: separately N4-corrected (default) or corrected with the T1w's N4 field")
     p.add_argument("--allow-unreviewed", action="store_true",
                    help="run even if visual_qc in the prep manifest is not PASS")
     p.add_argument("--mock-model", action="store_true",
@@ -221,6 +230,21 @@ def evaluate(pred, ref, m, labels, with_image_metrics=True, t1=None):
         _, smap = structural_similarity(p, r, data_range=1.0, win_size=7, full=True)
         row.update(MAE=float(np.mean(np.abs(d))), RMSE=rmse, PSNR=float(20 * np.log10(1.0 / max(rmse, 1e-12))),
                    pearson_r=float(np.corrcoef(pred[m], ref[m])[0, 1]), SSIM=float(smap[m].mean()))
+        mm = lambda x: (x - x[m].min()) / max(float(x[m].max() - x[m].min()), 1e-12)  # noqa: E731
+        e = np.abs(mm(pred) - mm(ref))
+        row["MAE_paper"] = float(e[m].mean())
+
+        def rmm(x):  # min-max after clipping to the image's own P0.1-P99.9
+            lo, hi = np.percentile(x[m], [0.1, 99.9])
+            return np.clip((x - lo) / max(float(hi - lo), 1e-12), 0.0, 1.0)
+        row["MAE_paper_p999"] = float(np.abs(rmm(pred) - rmm(ref))[m].mean())
+        yv, xv = mm(ref)[m], pred[m].astype(np.float64)
+        A = np.stack([xv, np.ones_like(xv)], 1)
+        coef = np.linalg.lstsq(A, yv, rcond=None)[0]
+        row["MAE_paper_cal"] = float(np.abs(A @ coef - yv).mean())
+        for k, name in ((1, "CSF"), (2, "GM"), (3, "WM")):
+            sel = m & (labels == k)
+            row[f"MAE_paper_{name}"] = float(e[sel].mean()) if sel.any() else float("nan")
     means = {}
     for k, name in ((1, "CSF"), (2, "GM"), (3, "WM")):
         sel = m & (labels == k)
@@ -232,19 +256,24 @@ def evaluate(pred, ref, m, labels, with_image_metrics=True, t1=None):
 
 
 # ======================================================================= per subject
-def load_native(prep_root, sub):
+# T2w reference per training target: "n4" = separately N4-corrected T2w (04_preprocess.py),
+# "sharedF" = T2w corrected with the T1w's N4 field (04b_shared_bias_target.py)
+T2_FILES = {"n4": "T2w_brain.nii.gz", "sharedF": "T2w_brain_sharedF.nii.gz"}
+
+
+def load_native(prep_root, sub, target="n4"):
     n = lambda f: os.path.join(prep_root, sub, "native", f)  # noqa: E731
     mimg = nib.load(n("brain_mask.nii.gz"))
     brain = (np.asarray(mimg.dataobj) > 0) & (np.asarray(nib.load(n("T2w_fov.nii.gz")).dataobj) > 0)
     sl = bbox_slices(brain)
     crop = lambda path: np.asarray(nib.load(path).dataobj, dtype=np.float32)[sl]  # noqa: E731
-    return mimg, brain[sl], sl, crop(n("T2w_brain.nii.gz")), crop(n("T1w_brain.nii.gz"))
+    return mimg, brain[sl], sl, crop(n(T2_FILES[target])), crop(n("T1w_brain.nii.gz"))
 
 
-def fit_lut(prep_root, subs):
+def fit_lut(prep_root, subs, target="n4"):
     pairs = []
     for s in subs:
-        _, b, _, r, t = load_native(prep_root, s)
+        _, b, _, r, t = load_native(prep_root, s, target)
         pairs.append((norm01(t, b)[b], norm01(r, b)[b]))
         print(f"  LUT: + {s} ({b.sum()} voxels)", flush=True)
     return lut_from_pairs(pairs)
@@ -308,7 +337,7 @@ def run_subject(sub, a, gen, lut=None):
                         "-t", aff, "-n", "NearestNeighbor", "-o", labels_native], check=True, capture_output=True)
 
     # ---- evaluation in native space, cropped to the brain bounding box
-    mimg, brain, sl, ref, t1 = load_native(a.prep_root, sub)
+    mimg, brain, sl, ref, t1 = load_native(a.prep_root, sub, a.target)
     vox = float(min(mimg.header.get_zooms()[:3]))
     core = ndimage.binary_erosion(brain, iterations=max(1, int(round(a.erode_mm / vox))))
     crop = lambda path: np.asarray(nib.load(path).dataobj, dtype=np.float32)[sl]  # noqa: E731
@@ -323,8 +352,10 @@ def run_subject(sub, a, gen, lut=None):
         preds["E0_T1w_LUT"] = np.where(brain, base, 0).astype(np.float32)
 
     rows = []
+    sfx = "" if a.target == "n4" else f"@{a.target}"  # keeps baselines of different targets apart in 08
+    preds = {(k if k.startswith(a.label + "_") else k + sfx): v for k, v in preds.items()}
     for mname, m in (("brain", brain), ("core", core)):
-        refrow = {"subject": sub, "method": "real_T2w (reference)", "mask": mname,
+        refrow = {"subject": sub, "method": "real_T2w (reference)" + sfx, "mask": mname,
                   **evaluate(ref, ref, m, labels, with_image_metrics=False)}
         rn = norm01(ref, m)[m]  # how much of this subject's T2w is a function of its own T1w at all
         refrow["T1_explainable_R2"] = float(1 - np.var(given_t1_residual(rn, norm01(t1, m)[m])) / np.var(rn))
@@ -366,7 +397,7 @@ def main():
         if leak:
             sys.exit(f"--fit-subs overlaps the evaluated subjects {leak}: the baseline would see its test data")
         print(f"fitting the T1w->T2w lookup-table baseline on {len(a.fit_subs)} subjects")
-        lut = fit_lut(a.prep_root, a.fit_subs)
+        lut = fit_lut(a.prep_root, a.fit_subs, a.target)
     rows, failed = [], []
     for sub in a.subs:
         print(f"[{sub}]", flush=True)

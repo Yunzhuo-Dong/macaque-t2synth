@@ -9,17 +9,23 @@ myelin-sensitive analyses.
 **Main findings** (19 macaques, PRIME-DE UC Davis, 5-fold subject-level cross-validation,
 every subject evaluated once as an unseen test subject):
 
-1. After fine-tuning, the synthetic T2w beats the **best possible voxel-wise mapping from
-   T1w intensity** (a lookup table learned on the training subjects) on every image metric
-   in the whole brain (19/19 subjects for Pearson r, SSIM, PSNR, beyond-T1 r; 17/19 for MAE;
-   Wilcoxon p ≤ 2·10⁻⁵), and it carries substantial T2w information that T1w intensity cannot
-   explain (partial correlation given T1w: 0.62).
-2. **Human pre-training matters**: at the same training budget (200 epochs), the network
-   initialised from the human GAN-MAT weights beats the same network trained from scratch
-   on all whole-brain metrics in 19/19 subjects.
-3. **Downstream T1w/T2w maps**: parcel-level myelin maps from synthetic T2w agree with
-   those from real T2w at r = 0.95 (group average; 0.90 per subject), versus 0.65 for the
-   T1w-only control.
+1. **Bias correction decides whether T1w/T2w myelin mapping works.** Correcting T1w and T2w
+   with two separate N4 fields removes the cortical myelin pattern from the T1w/T2w ratio
+   (vertex r with the raw-ratio map 0.14). The final model is therefore trained on a T2w
+   target corrected with the **T1w's own N4 field** (a shared field, as in the HCP
+   `T1w_restore`/`T2w_restore` images GAN-MAT was trained on), so that
+   N4 T1w / target = raw T1w / raw T2w.
+2. **Image level.** The fine-tuned synthetic T2w beats the best voxel-wise mapping from T1w
+   intensity (a lookup table learned on the training subjects) on every image metric in
+   19/19 subjects, whole brain and core (Wilcoxon p = 4·10⁻⁶): whole-brain Pearson r 0.83 vs
+   0.48, SSIM 0.69 vs 0.34, and it carries T2w information that T1w intensity cannot explain
+   (partial correlation given T1w 0.78).
+3. **Myelin maps.** Surface T1w/T2w myelin maps from the synthetic T2w reproduce those from the
+   real T2w: group map r = 0.96 (vertex level) / 0.97 (parcel means), MPC gradient 1 r = 0.93;
+   per subject 0.86 (vertex), 0.91 (parcel means), 0.83 (gradient), versus 0.36, 0.10 and
+   0.58 for the T1w-only control (19/19 subjects). Individual deviations from the group are
+   reproduced clearly for laminar-profile features (gradient, MPC, skewness: r 0.65–0.71) but
+   only weakly for the mean myelin map (r 0.33).
 
 Model weights are not released (see [Model weights](#model-weights)). Imaging data are not
 included (see [Data](#data)).
@@ -61,12 +67,14 @@ scripts/
   04d_nmt_channels.py     input channels from NMT labels (segmentation ablation)
   04e_cohort_qc.py        cohort QC table + montages
   04f_prep_progress.py    progress monitor for batch preprocessing
+  04b_shared_bias_target.py  T2w training target corrected with the T1w's N4 field (final target)
   05_e2_zeroshot.py       native-space evaluation of any generator checkpoint (+ baselines)
   07_finetune.py          fine-tuning (k-fold splits, frozen BN, masked L1, grad accumulation)
   07_run_cv.sh            runs the folds of one experiment, one fold per GPU
   07b_e3_summary.py       training/validation curves of all runs
   08_eval_cv.py           evaluates every fold, aggregates all subjects, paired tests
-  09_myelin.py            downstream T1w/T2w myelin analysis (subject + group level)
+  08b_plot_image_metrics.py  per-subject image-metric figure
+  10_myelin.py            surface T1w/T2w myelin analysis (MacaqueYerkes19 surfaces, GAN-MAT features)
 results/                  final result tables (CSV)
 docs/figures/             QC and result figures
 ```
@@ -96,6 +104,7 @@ contributors as requested by the PRIME-DE site page.
 | ANTs | 2.6.5 | N4, registration, resampling |
 | FSL | 6.0.7 | FAST tissue segmentation |
 | NMT v2.1 symmetric | — | macaque template, brain mask, segmentation, CHARM atlas |
+| MacaqueYerkes19 v1.2 32k_fs_LR | — | template white / pial / inflated / sphere surfaces for the myelin analysis (BALSA, Donahue et al. 2016) |
 | GAN-MAT | commit `414f2c7` + released `model.pth` | architecture and human weights |
 
 GPU: one NVIDIA RTX A5000 (24 GB) per training run; a run uses ~7.5 GB and ~2.7 s per
@@ -127,16 +136,21 @@ done
 ls -d "$PROJECT_DIR"/derivatives/prep/sub-* | xargs -n1 basename \
   | xargs -P 4 -I{} "$VENV_PY" 04c_seg_priors.py --subs {}   # NMT labels for evaluation
 
-# fine-tuning: 5 folds x {human init, from scratch}, one fold per GPU
-bash 07_run_cv.sh -- --batch-size 8 --epochs 200 --lr 8e-5 --tag official_long200
-bash 07_run_cv.sh -- --init scratch --batch-size 8 --epochs 200 --lr 2e-4 --tag scratch_long200
+# shared-field T2w target (T2w corrected with the T1w's own N4 field)
+ls -d "$PROJECT_DIR"/derivatives/prep/sub-* | xargs -n1 basename \
+  | xargs -P 4 -I{} "$VENV_PY" 04b_shared_bias_target.py --subs {}
 
-# evaluation of all folds + zero-shot, aggregated over the 19 test subjects
-"$VENV_PY" 08_eval_cv.py --zeroshot --tags official_long200 scratch_long200
+# fine-tuning: 5 folds, one fold per GPU
+bash 07_run_cv.sh -- --batch-size 8 --epochs 200 --lr 8e-5 --target sharedF --tag official_long200_sharedF
 
-# downstream myelin analysis
-"$VENV_PY" 09_myelin.py --list-subs | xargs -P 4 -I{} "$VENV_PY" 09_myelin.py --subs {}
-"$VENV_PY" 09_myelin.py --group
+# evaluation of all folds, aggregated over the 19 test subjects, + figure
+"$VENV_PY" 08_eval_cv.py --tags official_long200_sharedF
+"$VENV_PY" 08b_plot_image_metrics.py --out ../docs/figures/results_image_metrics.png
+
+# surface myelin analysis (Y = folder with the MacaqueYerkes19_v1.2 32k_fs_LR files)
+"$VENV_PY" 10_myelin.py --prepare --yerkes-dir "$Y"
+"$VENV_PY" 10_myelin.py --list-subs | xargs -P 4 -I{} "$VENV_PY" 10_myelin.py --yerkes-dir "$Y" --subs {}
+"$VENV_PY" 10_myelin.py --group --yerkes-dir "$Y"
 ```
 
 Every long step is restartable: finished stages, folds and evaluations are skipped.
@@ -161,11 +175,21 @@ Every long step is restartable: finished stages, folds and evaluations are skipp
 7. **FAST** (3 classes, `-N`) in the grid → three input channels (CSF, GM, WM), each holding
    the T1w intensity of its voxels and zero elsewhere, exactly as GAN-MAT builds its input.
 8. **Target**: T2w in the grid scaled to [-1, 1] as `2·T2/P99.9 − 1` (background −1),
-   matching the generator's tanh output convention.
+   matching the generator's tanh output convention. The final model uses the **shared-field
+   target** of `04b_shared_bias_target.py` (below) instead of the separately N4-corrected T2w.
 9. **QC figures + automatic checks** (brain volume, T2w FOV coverage, grid margin, FAST
    label order) in `manifest.json`; every subject was also reviewed visually.
 
 Figures: `docs/figures/prep_*.png` (one subject) and `prep_cohort_qc_page*.png` (cohort).
+
+**Shared-field target (`04b_shared_bias_target.py`).** Steps 2 and 5 correct T1w and T2w with two
+independent N4 fields F1 and F2. Their ratio is then (T1raw/T2raw)·(F2/F1), and F2/F1 is a smooth
+field spanning a factor of 2.1–2.2 (95th/5th percentile) in every subject — far larger than
+cortical myelin contrast, and it erases the myelin pattern (see the myelin section). HCP instead
+corrects both images with one field. Here the T2w is divided by the T1w's own N4 field,
+F1 = T1raw / T1w_N4 (exact, since N4 outputs input/field), so that T1w_N4 / T2w_sharedF =
+T1raw / T2raw. Only the T1w is needed to form F1, so training and application stay consistent
+and the network input is unchanged. The target is resampled and scaled exactly as in step 8.
 
 ![Brain mask](docs/figures/prep_01_brain_mask_sub-032128.png)
 
@@ -178,6 +202,7 @@ initialised from the released human weights and fine-tuned on macaque data
 | Setting | Value | Why |
 |---|---|---|
 | Initialisation | GAN-MAT human weights (`--init official`) | transfer from 752 HCP subjects |
+| Target | shared-field T2w (`--target sharedF`) | keeps the T1w/T2w myelin contrast |
 | Input normalisation | **human-matched z-score** (see below) | removes the macaque/human tissue-proportion offset |
 | Loss | L1 inside brain ∩ T2w FOV + 0.1 × L1 outside | generator only, no adversarial term |
 | BatchNorm | **frozen** (running statistics from human data; affine weights trainable) | the 1×1×1 bottleneck cannot be trained with batch size 1 |
@@ -194,12 +219,8 @@ volume, background zeros included, so the normalised values depend on the fracti
 grid each tissue occupies. Macaque brains have less white matter relative to grey matter than
 human brains; the human-matched variant computes each channel's mean and SD as if the tissue
 occupied the fraction measured in a human example (CSF 0.0404, GM 0.1091, WM 0.0753 of
-256³). With human fractions it equals the official z-score exactly. In the zero-shot setting
-it raised SSIM by about 0.17 in both pilot subjects, so it is used throughout.
-
-**From-scratch control.** Same network, data, loss and schedule, random pix2pix
-initialisation, BatchNorm in training mode (except the 1×1×1 bottleneck), learning rate
-2·10⁻⁴ (best of 8·10⁻⁵ and 2·10⁻⁴ on fold-0 validation), 200 epochs.
+256³). With human fractions it equals the official z-score exactly. In pilot tests it
+raised SSIM by about 0.17 in both pilot subjects, so it is used throughout.
 
 ## How we compare
 
@@ -208,14 +229,14 @@ initialisation, BatchNorm in training mode (except the 1×1×1 bottleneck), lear
   2 validation subjects, 13–14 training subjects. Each of the 19 subjects is a test subject
   exactly once; all methods are evaluated on the same subjects, masks and baselines.
 * **Native space.** Synthetic T2w is mapped from the model grid back to each subject's own
-  T1w grid with the inverse of the brain affine and compared with the acquired T2w there.
+  T1w grid with the inverse of the brain affine and compared with the acquired T2w there
+  (shared-field corrected, i.e. the same image the model was trained to produce). Every
+  control is fitted to and scored against that same reference.
 * **Methods compared**
 
   | Name | What it is |
   |---|---|
-  | **Fine-tuned (human init)** | GAN-MAT weights fine-tuned on the fold's training subjects |
-  | From scratch | same network trained from random weights |
-  | Zero-shot | untouched human GAN-MAT (same macaque preprocessing and normalisation) |
+  | **Fine-tuned** | GAN-MAT human weights fine-tuned on the fold's training subjects |
   | **T1w LUT** | the best voxel-wise function of T1w intensity: mean normalised T2w per 256 bins of normalised T1w, pooled over the fold's training subjects, applied to the test subject |
   | Inverted T1w | max(T1w) − T1w inside the brain |
   | T1w | the T1w itself (sanity check) |
@@ -251,7 +272,9 @@ min–max MAE track the intensity of a few outliers rather than anatomy.
 ## Results: synthetic T2w
 
 `results/cv_summary.csv`, `results/cv_paired.csv`, `results/cv_results_long.csv`;
-figure `docs/figures/results_image_metrics.png`. Mean ± SD over 19 test subjects.
+figure `docs/figures/results_image_metrics.png`. Mean ± SD over 19 test subjects; reference =
+real T2w corrected with the T1w's N4 field (in the tables the controls carry the suffix
+`@sharedF`).
 
 ![Image metrics](docs/figures/results_image_metrics.png)
 
@@ -259,136 +282,148 @@ figure `docs/figures/results_image_metrics.png`. Mean ± SD over 19 test subject
 
 | Method | MAE ↓ | PSNR ↑ | Pearson r ↑ | SSIM ↑ | beyond-T1 r ↑ | GM/WM contrast |
 |---|---|---|---|---|---|---|
-| **Fine-tuned, human init** | **0.075 ± 0.017** | **19.35 ± 1.16** | **0.744 ± 0.036** | **0.674 ± 0.034** | **0.621 ± 0.066** | 0.047 |
-| Same network, from scratch | 0.109 ± 0.023 | 16.78 ± 1.10 | 0.649 ± 0.047 | 0.613 ± 0.037 | 0.554 ± 0.074 | 0.053 |
-| Human GAN-MAT, zero-shot | 0.159 ± 0.023 | 14.42 ± 0.90 | 0.570 ± 0.046 | 0.506 ± 0.037 | 0.368 ± 0.047 | 0.128 |
-| T1w lookup table (LUT) | 0.142 ± 0.025 | 14.50 ± 0.80 | 0.481 ± 0.057 | 0.567 ± 0.041 | 0.000 | 0.159 |
-| Inverted T1w | 0.191 ± 0.037 | 13.08 ± 1.35 | 0.419 ± 0.097 | 0.541 ± 0.051 | 0.004 | 0.190 |
-| *Real T2w* | | | | | | *0.051* |
+| **Fine-tuned** | **0.076 ± 0.007** | **19.26 ± 0.68** | **0.829 ± 0.017** | **0.693 ± 0.030** | **0.780 ± 0.022** | 0.283 |
+| T1w lookup table (LUT) | 0.220 ± 0.022 | 11.52 ± 0.67 | 0.476 ± 0.062 | 0.341 ± 0.034 | 0.000 | 0.411 |
+| Inverted T1w | 0.147 ± 0.013 | 13.87 ± 0.65 | 0.419 ± 0.075 | 0.510 ± 0.035 | 0.003 | 0.190 |
+| *Real T2w* | | | | | | *0.232* |
 
 **Core (1 mm eroded)**
 
 | Method | MAE ↓ | PSNR ↑ | Pearson r ↑ | SSIM ↑ | beyond-T1 r ↑ | GM/WM contrast |
 |---|---|---|---|---|---|---|
-| **Fine-tuned, human init** | 0.096 ± 0.019 | **18.31 ± 1.24** | **0.781 ± 0.040** | 0.608 ± 0.042 | **0.450 ± 0.053** | 0.132 |
-| Same network, from scratch | 0.107 ± 0.021 | 16.68 ± 0.99 | 0.658 ± 0.058 | 0.542 ± 0.050 | 0.323 ± 0.069 | 0.155 |
-| Human GAN-MAT, zero-shot | 0.136 ± 0.020 | 15.46 ± 0.91 | 0.617 ± 0.054 | 0.493 ± 0.044 | 0.190 ± 0.048 | 0.196 |
-| T1w lookup table (LUT) | 0.096 ± 0.014 | 16.88 ± 0.99 | 0.620 ± 0.060 | 0.603 ± 0.046 | 0.044 ± 0.045 | 0.154 |
-| Inverted T1w | 0.097 ± 0.014 | 17.39 ± 0.85 | 0.665 ± 0.059 | 0.615 ± 0.049 | 0.006 | 0.179 |
-| *Real T2w* | | | | | | *0.083* |
+| **Fine-tuned** | **0.086 ± 0.010** | **19.14 ± 0.75** | **0.863 ± 0.017** | **0.643 ± 0.030** | **0.803 ± 0.015** | 0.376 |
+| T1w lookup table (LUT) | 0.192 ± 0.016 | 12.48 ± 0.60 | 0.540 ± 0.068 | 0.364 ± 0.032 | 0.032 ± 0.029 | 0.399 |
+| Inverted T1w | 0.132 ± 0.011 | 15.10 ± 0.58 | 0.532 ± 0.065 | 0.499 ± 0.039 | 0.003 | 0.178 |
+| *Real T2w* | | | | | | *0.269* |
 
-T1w intensity explains 29 % of the real T2w variance in the whole brain and 53 % in the
-core (T1-explainable R²), which is why a voxel-wise T1w mapping is a weak predictor
-near the brain surface and a strong one in deep tissue.
+T1w intensity explains 25 % of the real T2w variance in the whole brain and 33 % in the core
+(T1-explainable R²): the shared-field T2w keeps a smooth intensity component that no
+voxel-wise function of T1w can produce.
 
-**Paired comparisons (subjects in which the fine-tuned model is better, Wilcoxon p)**
+**Paired comparison, fine-tuned vs T1w LUT** (subjects in which the fine-tuned model is
+better, Wilcoxon p): MAE, PSNR, Pearson r, SSIM and beyond-T1 r are better in **19/19
+subjects in both masks, p = 4·10⁻⁶**.
 
-| vs | Mask | MAE | PSNR | Pearson r | SSIM | beyond-T1 r |
-|---|---|---|---|---|---|---|
-| T1w LUT | whole brain | 17/19, 2·10⁻⁵ | 19/19, 4·10⁻⁶ | 19/19, 4·10⁻⁶ | 19/19, 4·10⁻⁶ | 19/19, 4·10⁻⁶ |
-| T1w LUT | core | 9/19, 0.98 | 17/19, 3·10⁻⁴ | 19/19, 4·10⁻⁶ | 10/19, 0.54 | 19/19, 4·10⁻⁶ |
-| From scratch | whole brain | 19/19, 4·10⁻⁶ | 19/19, 4·10⁻⁶ | 19/19, 4·10⁻⁶ | 19/19, 4·10⁻⁶ | 19/19, 4·10⁻⁶ |
-| From scratch | core | 12/19, 0.055 | 17/19, 1·10⁻⁴ | 19/19, 4·10⁻⁶ | 19/19, 4·10⁻⁶ | 19/19, 4·10⁻⁶ |
-| Zero-shot | both | 19/19 on every score, 4·10⁻⁶ | | | | |
-
-In the core, the fine-tuned model correlates much better with the real T2w than the LUT
-and carries far more beyond-T1 information, while MAE and SSIM are on par with the LUT.
-
-**Sensitivity check.** The training length (200 epochs) was decided after inspecting fold-0
-test subjects (4 subjects). On the 15 subjects of folds 1–4, which never influenced any
-decision, the conclusions are unchanged: whole brain vs LUT, Pearson r 0.744 vs 0.495 and
-SSIM 0.676 vs 0.569 (15/15 each), MAE 0.076 vs 0.138 (13/15); vs from scratch 15/15 on all
-whole-brain scores; core Pearson r and beyond-T1 r 15/15 vs every control.
+**Caution on beyond-T1 r.** Part of what the model predicts beyond T1w intensity is the smooth
+field component of the target, which depends on position in the head rather than on cortical
+microstructure; a high beyond-T1 r therefore does not by itself show subject-specific
+microstructural information. The myelin analysis below tests that directly.
 
 ## Downstream T1w/T2w myelin analysis
 
-`09_myelin.py`; tables `results/myelin_*.csv`; figures `docs/figures/myelin_*.png` and
-`results_myelin_metrics.png`. Volume-based, adapted to the macaque instead of the human
-surface pipeline:
+`10_myelin.py`; tables `results/myelin_summary.csv`, `myelin_group_metrics.csv`,
+`myelin_subject_metrics.csv`; figures `docs/figures/myelin_*.png`. The analysis follows the
+GAN-MAT code (`preprocessing.sh`, `MPC.sh`, `build_mpc.py`, `preprocessing.py`), adapted to the
+macaque:
 
 | Step | Original paper (human) | Here (macaque) |
 |---|---|---|
-| Cortex | FreeSurfer surfaces | NMT v2.1 cortical GM mask warped to each subject with its SyN registration |
-| Parcels | human atlas | **CHARM** level 5 (macaque cortical hierarchy atlas); parcels ≥ 200 voxels; 73 parcels common to all subjects at group level |
-| Depth | 14 equivolumetric surfaces | relative depth d_pial / (d_pial + d_WM) from distance maps, 8 bins (macaque cortex ≈ 2 mm ≈ 6–7 voxels at 0.3 mm) |
-| Space | surface | native volume |
+| Ratio | min-max(N4 T1w) / min-max(T2w), clamped 0–100 | same; real T2w = shared-field T2w, so the real ratio equals raw T1w / raw T2w |
+| Surfaces | FreeSurfer white / pial per subject | MacaqueYerkes19 v1.2 white / pial (32k_fs_LR) warped into each subject: Yerkes19 → NMT v2.1 (ANTs SyN between the Yerkes19 cortical ribbon and the NMT cortical mask) → subject (its NMT registration) |
+| Depths | 14 equivolumetric surfaces (16 incl. pial / white, ends dropped), trilinear sampling | same |
+| Mesh, parcels | fsaverage5, Schaefer-300 | Yerkes19 32k vertices (shared by all subjects); **CHARM level 5 split by hemisphere** (159 parcels ≥ 30 vertices) |
+| Parcel profile | mean of vertices after removing those > 3 scaled MAD | same |
+| Features | profile moments (mean, SD, skewness, kurtosis); MPC = correlation of residual profiles given the mean profile, Fisher z; gradient = diffusion map (normalised angle, 90 % sparsity, α 0.5), Procrustes-aligned | same (gradient 1 sign-aligned to the group real-T2w gradient) |
+| Statistics | correlations real vs synthetic, 1000 spins | same; spins rotate parcel centroids on the Yerkes19 sphere (reflected for the right hemisphere) |
 
-**Ratio maps.** For each subject, T1w/T2w is computed from the real T2w, the synthetic T2w of
-the fold in which the subject was a test subject, the LUT T2w (training subjects of that
-fold) and the zero-shot T2w. All T2w versions are put on one **zero-preserving** scale (real:
-T2/P99.9; synthetic: (y+1)/2, which inverts the training target; LUT fitted on that scale), so
-ratio maps differ only by a global factor; each map (T1w / max(T2w, 0.02)) is divided by its
-cortical median.
+In addition, a **vertex-level map** (depth-averaged ratio divided by the subject's cortical mean,
+2 mm FWHM on the midthickness surface) gives an HCP-style surface myelin map, and **individual
+deviations** test subject-specific information: r(x − m, real − m), with m the mean real
+feature of the subjects in the other folds. A group template scores 0 on this by construction.
+Two vertex rings next to the medial wall are excluded.
 
-**Scores (synthetic-based vs real-based ratio maps)**
+![Surface myelin maps](docs/figures/myelin_surface_maps.png)
 
-| Score | Definition |
-|---|---|
-| voxel r | correlation over cortical voxels |
-| voxel r given T1w | partial correlation of log T2w (synthetic vs real) given T1w intensity, binned like the LUT. Because log(T1/T2) = log T1 − log T2 and log T1 is shared by all maps, this is the information in the ratio map beyond T1w; LUT scores exactly 0 |
-| relative MAE | mean \|R_synth − R_real\| / mean R_real |
-| parcel r | correlation of parcel-mean ratios across parcels |
-| profile moments r | mean, SD, skewness, kurtosis of each parcel's depth profile, correlated across parcels |
-| MPC r | microstructural profile covariance: partial correlation between parcel depth profiles given the mean profile (Fisher z); correlation of upper triangles |
-| gradient r | first diffusion-map gradient of the group MPC (row-wise 90 % sparsity, normalised-angle affinity, α = 0.5); absolute correlation |
+Single HCP-style panels: `docs/figures/myelin_hcp_style_real.png`, `docs/figures/myelin_hcp_style_synthetic.png`;
+group MPC matrices: `docs/figures/myelin_mpc.png`.
 
-**Per subject (mean ± SD, n = 19)**
+**Group level** (feature of the 19-subject mean vs the real-T2w mean; all p_spin = 0.001 for
+the synthetic T2w)
 
-| Score | Fine-tuned | T1w LUT | Zero-shot | Fine-tuned better than LUT |
+| Feature | Synthetic T2w | T1w LUT |
+|---|---|---|
+| vertex map r | **0.957** | 0.218 |
+| profile mean (parcel myelin map) | **0.972** | 0.051 (p_spin 0.73) |
+| profile SD | **0.947** | 0.560 |
+| profile skewness | **0.894** | 0.747 |
+| profile kurtosis | **0.882** | 0.463 |
+| MPC gradient 1 | **0.927** | 0.660 |
+| MPC matrix | **0.860** | 0.650 |
+
+**Individual level** (each subject vs its own real-T2w map; mean ± SD over 19 subjects; the
+synthetic T2w is better than the LUT in the stated number of subjects, Wilcoxon p)
+
+| Feature | Synthetic T2w | T1w LUT | Synthetic better | p |
 |---|---|---|---|---|
-| **parcel r** | **0.895 ± 0.052** | 0.754 ± 0.154 | 0.799 ± 0.052 | 19/19, p = 4·10⁻⁶ |
-| **profile mean r** | **0.896 ± 0.051** | 0.741 ± 0.127 | 0.784 ± 0.070 | 19/19, p = 4·10⁻⁶ |
-| **voxel r given T1w** | **0.425 ± 0.043** | 0.000 | 0.215 ± 0.038 | 19/19, p = 4·10⁻⁶ |
-| profile SD r | 0.756 ± 0.144 | 0.685 ± 0.122 | 0.582 ± 0.176 | 13/19, p = 0.03 |
-| profile skewness r | 0.753 ± 0.083 | 0.728 ± 0.078 | 0.630 ± 0.088 | 14/19, p = 0.08 |
-| profile kurtosis r | 0.586 ± 0.129 | 0.536 ± 0.124 | 0.403 ± 0.112 | 13/19, p = 0.08 |
-| voxel r | 0.767 ± 0.033 | **0.780 ± 0.048** | 0.659 ± 0.035 | 2/19 |
-| relative MAE ↓ | 0.076 ± 0.005 | **0.067 ± 0.006** | 0.201 ± 0.013 | 0/19 |
-| MPC r | 0.615 ± 0.078 | 0.647 ± 0.121 | 0.466 ± 0.129 | 7/19, p = 0.20 |
+| vertex map r | **0.861 ± 0.026** | 0.360 ± 0.095 | 19/19 | 4·10⁻⁶ |
+| profile mean r | **0.909 ± 0.014** | 0.096 ± 0.115 | 19/19 | 4·10⁻⁶ |
+| profile SD r | **0.887 ± 0.032** | 0.577 ± 0.093 | 19/19 | 4·10⁻⁶ |
+| profile skewness r | **0.835 ± 0.048** | 0.681 ± 0.056 | 19/19 | 4·10⁻⁶ |
+| profile kurtosis r | **0.753 ± 0.074** | 0.352 ± 0.107 | 19/19 | 4·10⁻⁶ |
+| gradient 1 r | **0.828 ± 0.059** | 0.576 ± 0.175 | 19/19 | 4·10⁻⁶ |
+| MPC r | **0.736 ± 0.058** | 0.552 ± 0.047 | 19/19 | 4·10⁻⁶ |
 
-**Group average (73 parcels)**
+All 19 subjects have p_spin < 0.05 for every synthetic-T2w feature.
 
-| Score | Fine-tuned | T1w LUT | Zero-shot |
-|---|---|---|---|
-| parcel r | **0.947** | 0.654 | 0.855 |
-| MPC r | **0.816** | 0.802 | 0.719 |
-| gradient 1 \|r\| | 0.768 | 0.780 | **0.858** |
-| profile mean r | **0.947** | 0.611 | 0.835 |
-| profile SD r | **0.896** | 0.745 | 0.708 |
-| profile skewness r | **0.776** | 0.625 | 0.677 |
-| profile kurtosis r | **0.740** | 0.440 | 0.471 |
+**Individual deviations from the other subjects' mean**
 
-![Myelin metrics](docs/figures/results_myelin_metrics.png)
+| Feature | Synthetic T2w | T1w LUT | Synthetic better | p |
+|---|---|---|---|---|
+| profile mean (myelin map) | 0.331 ± 0.338 | 0.179 ± 0.435 | 16/19 | 1·10⁻⁴ |
+| profile SD | 0.502 ± 0.191 | 0.268 ± 0.278 | 18/19 | 8·10⁻⁶ |
+| profile skewness | **0.708 ± 0.089** | 0.467 ± 0.105 | 19/19 | 4·10⁻⁶ |
+| profile kurtosis | 0.558 ± 0.128 | 0.190 ± 0.117 | 19/19 | 4·10⁻⁶ |
+| gradient 1 | **0.695 ± 0.093** | 0.381 ± 0.191 | 19/19 | 4·10⁻⁶ |
+| MPC | **0.654 ± 0.064** | 0.434 ± 0.061 | 19/19 | 4·10⁻⁶ |
 
-![Group MPC and gradients](docs/figures/myelin_group.png)
+![Individual level](docs/figures/myelin_individual.png)
 
-**Interpretation.** The synthetic T2w restores the **regional** myelin pattern (parcel-level
-ratio r 0.95 vs 0.65 for T1w alone) and the mean laminar profile. Voxel-wise ratio
-similarity and MPC/gradient similarity, however, are reached equally well by the T1w-only
-LUT: the shared T1w numerator dominates voxel-wise variation, and in this volume-based
-implementation the depth-profile covariance is largely determined by T1w laminar contrast.
-MPC and gradient similarity therefore cannot on their own demonstrate the value of a
-synthetic T2w; parcel-level maps, profile means and the given-T1w partial correlation can.
+![Parcel myelin maps](docs/figures/myelin_parcel_mean.png)
+
+![Gradient 1](docs/figures/myelin_parcel_G1.png)
+
+**Interpretation.**
+* The synthetic T2w restores the cortical T1w/T2w myelin map (group r 0.96–0.97), which T1w
+  alone cannot (LUT 0.05–0.22): the regional myelin contrast lives in the smooth component of
+  the T2w that the shared-field target preserves.
+* Laminar-profile features (MPC, gradient, skewness) are reproduced per subject, including the
+  way each subject deviates from the group (r 0.65–0.71, all 19 subjects significant). Part of
+  this is shared surface geometry and partial volume, which the LUT also captures
+  (0.38–0.47); the synthetic T2w adds a consistent 0.2–0.3 on top.
+* The subject-specific part of the **mean myelin map** is reproduced only weakly
+  (r 0.33 ± 0.34, significant in 63 % of subjects). In this cohort individual myelin maps are
+  dominated by the shared group pattern: the mean real map of the other subjects predicts a
+  subject's map at r ≈ 0.95. How much of the real individual deviation is measurement noise is
+  unknown without repeated scans.
 
 ## Comparison with the original GAN-MAT paper
 
-Original values: GAN-MAT bioRxiv preprint (10.1101/2023.04.20.537642), HCP test set. The
-pipelines differ (surfaces with 14 depths in human vs volume with 8 depth bins and CHARM
-parcels here), so the comparison indicates the level of agreement, not a like-for-like test.
+Original values: GAN-MAT bioRxiv preprint (10.1101/2023.04.20.537642), HCP test set; the paper
+reports a mean-moment r of only 0.08 on its independent SMC dataset. The macaque values are
+within one site (cross-validated), with template-warped surfaces and CHARM parcels, so the
+comparison indicates the level of agreement, not a like-for-like test.
 
 | Feature similarity (real vs synthetic) | Human, original paper | Macaque, here (group) | Macaque, T1w-only control |
 |---|---|---|---|
-| Microstructural gradient | 0.71 | 0.77 | 0.78 |
-| Profile mean | 0.70 | 0.95 | 0.61 |
-| Profile SD | 0.53 | 0.90 | 0.75 |
-| Profile skewness | 0.77 | 0.78 | 0.63 |
-| Profile kurtosis | 0.63 | 0.74 | 0.44 |
+| Microstructural gradient | 0.71 | 0.93 | 0.66 |
+| Profile mean | 0.70 | 0.97 | 0.05 |
+| Profile SD | 0.53 | 0.95 | 0.56 |
+| Profile skewness | 0.77 | 0.89 | 0.75 |
+| Profile kurtosis | 0.63 | 0.88 | 0.46 |
 
-The original paper did not include a T1w-only control; the last column shows why one is
-needed when interpreting gradient similarity.
+The original paper did not include a T1w-only control or a group-template baseline; both are
+needed to interpret gradient similarity and individual-level agreement.
 
 ## Development notes and limitations
 
+* **Separate vs shared bias correction.** The first model was trained on the separately
+  N4-corrected T2w. Its synthetic T2w scored well on image metrics, but T1w/T2w maps from it —
+  and from the real T2w treated the same way — did not reproduce the HCP Yerkes19 group myelin
+  map (r 0.13) and were dominated by cortical folding (R² ≈ 0.5). Literature-style mapping with
+  raw T1w / raw T2w on surfaces recovered it (r 0.85 vs Yerkes19 MyelinMap_BC, folding
+  R² 0.04), while the separately N4-corrected real T2w gave r 0.06 with that map and 0.14 with
+  the raw-ratio map. Retraining with
+  the shared-field target fixed the synthetic maps (subject-level profile-mean r 0.04 → 0.91).
 * **Why preprocessing mattered.** A first pilot with BET + FLIRT to human MNI gave a T1w–T2w
   correlation of +0.47 inside the "brain" mask; with the NMT-based mask it is −0.42 to −0.73,
   showing that the pilot mask contained non-brain tissue. Every result above uses the
@@ -396,22 +431,22 @@ needed when interpreting gradient similarity.
 * **FAST in the macaque.** With a tight macaque brain mask there is little CSF, and FAST labels
   much of deep grey matter and part of the cortical ribbon as WM (WM ≈ 54 % of the brain vs
   ≈ 30 % in the NMT segmentation). NMT priors (`-P`) did not change this. Segmentation was
-  therefore tested as a factor in the zero-shot experiment: plain FAST (which treats deep GM
-  as WM, like FAST on human T1w) performed best with the human-matched normalisation and is
-  used for all models. NMT labels are used only for evaluation (GM/WM contrast).
-* **Training length.** Recipes were selected on fold-0 validation subjects. A 60-epoch
-  schedule first suggested that from-scratch training was far worse; a 200-epoch from-scratch
-  run closed most of that gap on validation, so both initialisations were retrained for 200
-  epochs. At equal length, human initialisation remains better on the test subjects. The
-  choice of 200 epochs used fold-0 test results; see the folds 1–4 sensitivity check above.
+  therefore tested as a factor in pilot experiments: plain FAST (which treats deep GM as WM,
+  like FAST on human T1w) performed best with the human-matched normalisation and is used
+  for the model. NMT labels are used only for evaluation (GM/WM contrast).
+* **Training length.** Learning rate and schedule were selected on fold-0 validation subjects.
+  The decision to train for 200 epochs was made after inspecting the fold-0 test subjects
+  (4 of 19) in earlier experiments with the previous target; the same recipe was then used
+  unchanged for the shared-field target and all folds.
 * **Validation MAE is not a test proxy.** Validation MAE (grid space, [-1, 1] target units)
-  was almost identical for the two 200-epoch models (0.083 vs 0.082) although the native-space
-  test metrics differed clearly; it mostly reflects intensity calibration.
+  mostly reflects intensity calibration and changed little between candidate recipes whose
+  native-space test metrics differed clearly.
 * **Scope.** One site (UC Davis), one scanner, anaesthetised adult rhesus macaques, n = 19.
-  Generalisation to other sites, species, ages and awake scanning is untested. The myelin
-  analysis is volume-based; a surface-based macaque pipeline remains future work. In the core
-  region the fine-tuned model exaggerates GM/WM contrast (0.132 vs 0.083 in real T2w), as do
-  the LUT and the other controls.
+  Generalisation to other sites, species, ages and awake scanning is untested. Cortical
+  surfaces are the Yerkes19 template warped to each subject, not subject-specific
+  reconstructions (FreeSurferNHP, CIVET-macaque, PREEMACS). No repeated scans were available
+  to estimate the noise ceiling of individual myelin deviations. The min-max proxy MAE of the
+  GAN-MAT pipeline depends on single-voxel maxima and is not used here.
 
 ## Model weights
 
@@ -425,6 +460,10 @@ reproduce them from the GAN-MAT release and PRIME-DE data is in `scripts/`.
   covariance analysis toolbox. *NeuroImage*. Code: github.com/CAMIN-neuro/GAN-MAT.
 * Milham et al. (2018). An open resource for non-human primate imaging. *Neuron* (PRIME-DE).
   Data: PRIME-DE University of California Davis site, CC-BY-NC-SA.
+* Donahue et al. (2016). Using diffusion tractography to predict cortical connection strength
+  and distance: a quantitative comparison with tracers in the monkey. *J Neurosci*
+  (MacaqueYerkes19 surfaces); Autio et al. (2020), *NeuroImage* (HCP-NHP myelin mapping);
+  Glasser & Van Essen (2011), *J Neurosci* (T1w/T2w myelin mapping).
 * Jung et al. (2021). A comprehensive macaque fMRI pipeline and hierarchical atlas.
   *NeuroImage* (NMT v2, CHARM).
 * Avants et al., ANTs; Jenkinson et al., FSL (FAST: Zhang et al., 2001).

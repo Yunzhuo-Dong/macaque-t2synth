@@ -71,6 +71,9 @@ def parse_args():
     g.add_argument("--overfit", metavar="SUB", help="train and validate on this one subject (sanity check)")
     g.add_argument("--seg", choices=list(E2.SEGS), default="fast")
     g.add_argument("--norm", choices=list(E2.VARIANTS), default="human_matched")
+    g.add_argument("--target", choices=["n4", "sharedF"], default="n4",
+                   help="T2w target: separately N4-corrected (04_preprocess.py) or corrected with the T1w's "
+                        "own N4 field (04b_shared_bias_target.py; keeps the T1w/T2w myelin contrast)")
     g.add_argument("--allow-unreviewed", action="store_true", help="include subjects whose visual_qc is not PASS")
     m = p.add_argument_group("model")
     m.add_argument("--ganmat-root", default=env("GANMAT_ROOT"))
@@ -105,7 +108,8 @@ def parse_args():
     a.bn = a.bn or ("frozen" if a.init == "official" else "train")
     a.tag = a.tag or (f"{a.init}_{a.seg}_{a.norm}_{a.train_layers}_lr{a.lr:g}"
                       + (f"_bs{a.batch_size}" if a.batch_size > 1 else "")
-                      + ("_cos" if a.lr_schedule == "cosine" else ""))
+                      + ("_cos" if a.lr_schedule == "cosine" else "")
+                      + ("" if a.target == "n4" else f"_{a.target}"))
     return a
 
 
@@ -150,7 +154,10 @@ def load_subject(s, a):
     g = lambda f: os.path.join(a.prep_root, s, "grid", f)  # noqa: E731
     x, _ = E2.normalise(np.load(g(E2.SEGS[a.seg])), a.norm)
     x = np.ascontiguousarray(x.transpose(3, 0, 1, 2))
-    y = np.load(g("T2w_grid_target.npy")).astype(np.float32)[None]
+    tname = "T2w_grid_target.npy" if a.target == "n4" else f"T2w_grid_target_{a.target}.npy"
+    if not os.path.exists(g(tname)):
+        sys.exit(f"{s}: {tname} missing; run 04b_shared_bias_target.py first")
+    y = np.load(g(tname)).astype(np.float32)[None]
     v = np.asarray(nib.load(g("valid_grid.nii.gz")).dataobj).astype(np.uint8)[None]
     return {"x": x, "y": y, "v": v, "bg": x[:, 0, 0, 0].copy()}  # corner voxel = background
 
@@ -467,7 +474,7 @@ def main():
         print("evaluate the test subjects in native space with:\n"
               f'  "$VENV_PY" 05_e2_zeroshot.py --subs {" ".join(split["test"])} --checkpoint '
               f'{os.path.join(out, "ckpt_best.pth")} --label E3 --segs {a.seg} --variants {a.norm} '
-              f'--fit-subs {" ".join(split["train"])} --out-root {os.path.join(out, "eval")}')
+              f'--fit-subs {" ".join(split["train"])} --target {a.target} --out-root {os.path.join(out, "eval")}')
 
 
 if __name__ == "__main__":
